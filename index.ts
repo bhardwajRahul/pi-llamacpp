@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { streamOpenAICompletions } from "@earendil-works/pi-ai";
 import type { AssistantMessage, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
@@ -1633,160 +1634,30 @@ function errorAssistantMessage(model: Model<any>, error: unknown, aborted = fals
 	};
 }
 
-function parseStreamingJson(value: string): Record<string, any> {
-	try {
-		return JSON.parse(value) as Record<string, any>;
-	} catch {
-		return {};
-	}
-}
+function applyLlamaCppPayloadDefaults(payload: unknown, reasoningEnabled: boolean): Record<string, any> {
+	const base = payload && typeof payload === "object" && !Array.isArray(payload) ? (payload as Record<string, any>) : {};
+	const chatTemplateKwargs =
+		base.chat_template_kwargs && typeof base.chat_template_kwargs === "object" && !Array.isArray(base.chat_template_kwargs)
+			? (base.chat_template_kwargs as Record<string, any>)
+			: {};
 
-function stringifyToolArguments(args: unknown): string {
-	if (typeof args === "string") return args;
-	try {
-		return JSON.stringify(args ?? {});
-	} catch {
-		return "{}";
-	}
-}
-
-function messageText(content: any): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	return content
-		.map((item) => {
-			if (item?.type === "text") return item.text ?? "";
-			if (item?.type === "image") return "[image omitted: local llama.cpp model is text-only]";
-			return "";
-		})
-		.join("");
-}
-
-function convertMessagesForLlamaCpp(context: Context): any[] {
-	const messages: any[] = [];
-	if (context.systemPrompt) messages.push({ role: "system", content: context.systemPrompt });
-
-	for (const msg of context.messages as any[]) {
-		if (msg.role === "user") {
-			messages.push({ role: "user", content: messageText(msg.content) });
-		} else if (msg.role === "assistant") {
-			const text = (msg.content ?? [])
-				.filter((block: any) => block.type === "text")
-				.map((block: any) => block.text ?? "")
-				.join("");
-			const toolCalls = (msg.content ?? []).filter((block: any) => block.type === "toolCall");
-			const out: any = { role: "assistant", content: text || (toolCalls.length > 0 ? null : "") };
-			if (toolCalls.length > 0) {
-				out.tool_calls = toolCalls.map((block: any) => ({
-					id: block.id,
-					type: "function",
-					function: { name: block.name, arguments: stringifyToolArguments(block.arguments) },
-				}));
-			}
-			messages.push(out);
-		} else if (msg.role === "toolResult") {
-			messages.push({
-				role: "tool",
-				tool_call_id: msg.toolCallId,
-				name: msg.toolName,
-				content: messageText(msg.content),
-			});
-		}
-	}
-	return messages;
-}
-
-function convertToolsForLlamaCpp(tools: any[] | undefined): any[] | undefined {
-	if (!tools || tools.length === 0) return undefined;
-	return tools.map((tool) => ({
-		type: "function",
-		function: {
-			name: tool.name,
-			description: tool.description,
-			parameters: tool.parameters,
-		},
-	}));
-}
-
-function mapFinishReason(reason: string | null | undefined): "stop" | "length" | "toolUse" | "error" {
-	if (!reason || reason === "stop") return "stop";
-	if (reason === "length") return "length";
-	if (reason === "tool_calls" || reason === "function_call") return "toolUse";
-	return "error";
-}
-
-function usageFromChunkUsage(usage: any, model: Model<any>): AssistantMessage["usage"] {
-	const input = usage?.prompt_tokens ?? usage?.input_tokens ?? 0;
-	const output = usage?.completion_tokens ?? usage?.output_tokens ?? 0;
-	const cacheRead = usage?.prompt_tokens_details?.cached_tokens ?? usage?.cache_read_input_tokens ?? 0;
-	const totalTokens = usage?.total_tokens ?? input + output + cacheRead;
 	return {
-		input,
-		output,
-		cacheRead,
-		cacheWrite: 0,
-		totalTokens,
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-	};
-}
-
-function buildLlamaCppPayload(model: Model<any>, context: Context, options?: SimpleStreamOptions): Record<string, any> {
-	const reasoningEnabled = !!options?.reasoning;
-	const payload: Record<string, any> = {
-		model: model.id,
-		messages: convertMessagesForLlamaCpp(context),
-		stream: true,
-		stream_options: { include_usage: true },
 		...(reasoningEnabled ? QWEN_THINKING_SAMPLING : QWEN_INSTRUCT_SAMPLING),
+		...base,
 		chat_template_kwargs: {
 			enable_thinking: reasoningEnabled,
 			preserve_thinking: true,
+			...chatTemplateKwargs,
 		},
 	};
-	if (options?.maxTokens) payload.max_tokens = options.maxTokens;
-	if (options?.temperature !== undefined) payload.temperature = options.temperature;
-	const tools = convertToolsForLlamaCpp(context.tools as any[] | undefined);
-	if (tools) payload.tools = tools;
-	return payload;
-}
-
-async function readSse(response: Response, onData: (data: string) => void): Promise<void> {
-	if (!response.body) return;
-	const reader = response.body.getReader();
-	const decoder = new TextDecoder();
-	let buffer = "";
-	while (true) {
-		const { value, done } = await reader.read();
-		if (done) break;
-		buffer += decoder.decode(value, { stream: true });
-		let index: number;
-		while ((index = buffer.indexOf("\n\n")) >= 0) {
-			const raw = buffer.slice(0, index).replace(/\r/g, "");
-			buffer = buffer.slice(index + 2);
-			const data = raw
-				.split("\n")
-				.filter((line) => line.startsWith("data:"))
-				.map((line) => line.slice(5).trimStart())
-				.join("\n");
-			if (data) onData(data);
-		}
-	}
 }
 
 function streamLlamaCpp(model: Model<any>, context: Context, options?: SimpleStreamOptions) {
 	const stream = createLocalAssistantMessageEventStream();
 	void (async () => {
-		const output: AssistantMessage = errorAssistantMessage(model, "");
-		output.stopReason = "stop";
-		delete output.errorMessage;
-
 		try {
 			const managedModel = MODEL_BY_ID.get(model.id);
 			if (!managedModel) throw new Error(`Unknown llama.cpp model: ${model.id}`);
-
-			let payload = buildLlamaCppPayload(model, context, options);
-			const nextPayload = await options?.onPayload?.(payload, model);
-			if (nextPayload !== undefined) payload = nextPayload as Record<string, any>;
 
 			await ensureServerManaged(managedModel, (message) => {
 				if (message) void appendLog(`[${new Date().toISOString()}] ${message}\n`).catch(() => {});
@@ -1796,93 +1667,20 @@ function streamLlamaCpp(model: Model<any>, context: Context, options?: SimpleStr
 				throw new Error(`llama-server state is not ready for ${managedModel.id}`);
 			}
 
-			const response = await fetch(`${state.baseUrl}/chat/completions`, {
-				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify(payload),
-				signal: options?.signal,
-			});
-			const headers: Record<string, string> = {};
-			response.headers.forEach((value, key) => (headers[key] = value));
-			await options?.onResponse?.({ status: response.status, headers }, model);
-			if (!response.ok) throw new Error(`${response.status} ${await response.text()}`);
+			const runtimeModel = { ...model, baseUrl: state.baseUrl } as Model<"openai-completions">;
+			const inner = streamOpenAICompletions(runtimeModel, context, {
+				...(options as any),
+				apiKey: options?.apiKey ?? API_KEY,
+				reasoningEffort: options?.reasoning,
+				onPayload: async (payload: unknown) => {
+					const llamaPayload = applyLlamaCppPayloadDefaults(payload, !!options?.reasoning);
+					const nextPayload = await options?.onPayload?.(llamaPayload, model);
+					return nextPayload === undefined ? llamaPayload : nextPayload;
+				},
+				onResponse: (response: any) => options?.onResponse?.(response, model),
+			} as any);
 
-			stream.push({ type: "start", partial: output });
-			let textBlock: any;
-			let thinkingBlock: any;
-			const toolCallsByIndex = new Map<number, any>();
-
-			const contentIndex = (block: any) => output.content.indexOf(block);
-			const ensureTextBlock = () => {
-				if (!textBlock) {
-					textBlock = { type: "text", text: "" };
-					output.content.push(textBlock);
-					stream.push({ type: "text_start", contentIndex: contentIndex(textBlock), partial: output });
-				}
-				return textBlock;
-			};
-			const ensureThinkingBlock = () => {
-				if (!thinkingBlock) {
-					thinkingBlock = { type: "thinking", thinking: "", thinkingSignature: "reasoning_content" };
-					output.content.push(thinkingBlock);
-					stream.push({ type: "thinking_start", contentIndex: contentIndex(thinkingBlock), partial: output });
-				}
-				return thinkingBlock;
-			};
-			const ensureToolCallBlock = (toolCall: any) => {
-				const index = typeof toolCall.index === "number" ? toolCall.index : toolCallsByIndex.size;
-				let block = toolCallsByIndex.get(index);
-				if (!block) {
-					block = { type: "toolCall", id: toolCall.id || `call_${index}`, name: "", arguments: {}, partialArgs: "" };
-					toolCallsByIndex.set(index, block);
-					output.content.push(block);
-					stream.push({ type: "toolcall_start", contentIndex: contentIndex(block), partial: output });
-				}
-				return block;
-			};
-
-			await readSse(response, (data) => {
-				if (data === "[DONE]") return;
-				const chunk = JSON.parse(data);
-				if (chunk.usage) output.usage = usageFromChunkUsage(chunk.usage, model);
-				const choice = chunk.choices?.[0];
-				if (!choice) return;
-				if (choice.finish_reason) output.stopReason = mapFinishReason(choice.finish_reason);
-				const delta = choice.delta ?? {};
-				if (typeof delta.content === "string" && delta.content.length > 0) {
-					const block = ensureTextBlock();
-					block.text += delta.content;
-					stream.push({ type: "text_delta", contentIndex: contentIndex(block), delta: delta.content, partial: output });
-				}
-				const reasoning = delta.reasoning_content ?? delta.reasoning ?? delta.reasoning_text;
-				if (typeof reasoning === "string" && reasoning.length > 0) {
-					const block = ensureThinkingBlock();
-					block.thinking += reasoning;
-					stream.push({ type: "thinking_delta", contentIndex: contentIndex(block), delta: reasoning, partial: output });
-				}
-				for (const toolCall of delta.tool_calls ?? []) {
-					const block = ensureToolCallBlock(toolCall);
-					if (toolCall.id) block.id = toolCall.id;
-					if (toolCall.function?.name) block.name = toolCall.function.name;
-					const argDelta = toolCall.function?.arguments ?? "";
-					if (argDelta) {
-						block.partialArgs += argDelta;
-						block.arguments = parseStreamingJson(block.partialArgs);
-					}
-					stream.push({ type: "toolcall_delta", contentIndex: contentIndex(block), delta: argDelta, partial: output });
-				}
-			});
-
-			if (thinkingBlock) stream.push({ type: "thinking_end", contentIndex: contentIndex(thinkingBlock), content: thinkingBlock.thinking, partial: output });
-			if (textBlock) stream.push({ type: "text_end", contentIndex: contentIndex(textBlock), content: textBlock.text, partial: output });
-			for (const block of toolCallsByIndex.values()) {
-				delete block.partialArgs;
-				stream.push({ type: "toolcall_end", contentIndex: contentIndex(block), toolCall: block, partial: output });
-			}
-
-			if (options?.signal?.aborted) throw new Error("Request was aborted");
-			if (output.stopReason === "error") throw new Error("llama.cpp returned an error stop reason");
-			stream.push({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output });
+			for await (const event of inner as any) stream.push(event);
 			stream.end();
 		} catch (error) {
 			const message = errorAssistantMessage(model, error, !!options?.signal?.aborted);
